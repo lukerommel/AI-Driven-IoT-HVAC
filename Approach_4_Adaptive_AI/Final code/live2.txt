@@ -1,0 +1,1028 @@
+import time
+import json
+import csv
+from datetime import datetime
+from pathlib import Path
+from statistics import fmean
+from typing import Optional, List
+from collections import deque
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import board
+import busio
+import adafruit_dht
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+from openpyxl import Workbook, load_workbook
+
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+# ================== USER SETTINGS ==================
+DHT_GPIO = board.D4
+LOG_INTERVAL_SEC = 2.0
+
+PROJECT_DIR = Path("/home/team8/Desktop/Project/Approach_4_Adaptive_AI")
+INPUT_DATA_DIR = PROJECT_DIR / "input_data"
+INPUT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+GRAPH_DIR = PROJECT_DIR / "graphs"
+GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+
+EXCEL_PATH = INPUT_DATA_DIR / "live_hvac_data.xlsx"
+CSV_PATH = INPUT_DATA_DIR / "live_hvac_data.csv"
+SHEET_NAME = "Readings"
+
+BASELINE_JSON_PATH = PROJECT_DIR / "baseline_config.json"
+SESSION_SUMMARY_JSON_PATH = PROJECT_DIR / "session_summary.json"
+
+# Increased for stronger baseline
+CALIBRATION_READINGS = 30
+MIN_STD_EPSILON = 0.001
+
+# ADS1115 config
+ADS_ADDR = 0x48
+ADS_GAIN = 1
+ADS_DATARATE = 860
+
+# Channel mapping
+VOLTAGE_CHANNEL = 0
+CURRENT_CHANNEL = 1
+
+# RMS sampling
+SAMPLE_WINDOW_SEC = 0.20
+OFFSET_SAMPLES = 40
+TARGET_SAMPLE_HZ = 700
+
+# ZMPT calibration
+ZMPT_TO_MAINS_SCALE = 350.0
+CALIBRATION_K = 230.0 / 115.0
+
+# ACS712 calibration
+ACS_SENSITIVITY = 0.030  # volts per amp
+
+# Save frequently
+SAVE_EVERY_ROWS = 3
+SAVE_EVERY_SEC = 5
+
+# Efficiency settings
+SEI_SCALE_FACTOR = 1000
+PERSISTENT_LIMIT = 3
+LOW_LOAD_POWER_THRESHOLD = 20
+HIGH_POWER_THRESHOLD = 500
+MAX_REASONABLE_COOLING_RATE = 5.0
+
+# Sanity ranges
+MIN_REASONABLE_VOLTAGE = 150
+MAX_REASONABLE_VOLTAGE = 300
+MIN_REASONABLE_CURRENT = 0
+MAX_REASONABLE_CURRENT = 30
+MIN_REASONABLE_TEMPERATURE = 10
+MAX_REASONABLE_TEMPERATURE = 60
+MIN_REASONABLE_HUMIDITY = 0
+MAX_REASONABLE_HUMIDITY = 100
+
+# ML settings
+ML_MIN_VALID_ROWS = 15
+ML_CONTAMINATION = 0.05
+ML_RANDOM_STATE = 42
+# ===================================================
+
+HEADERS = [
+    "Timestamp",
+    "Mode",
+    "Temperature_C",
+    "Humidity_%",
+    "A0_Voltage_V",
+    "Vrms_ADC",
+    "Mains_Vrms_Est",
+    "A1_Current_V",
+    "Irms_A",
+    "ApparentPower_VA",
+    "Cooling_Rate_C_per_min",
+    "Effective_Cooling_Rate_C_per_min",
+    "Smart_Efficiency_Index",
+    "CoolingRate_MA_5",
+    "Power_MA_5",
+    "SEI_MA_5",
+    "ML_Prediction",
+    "ML_Score",
+    "ML_Label",
+    "Rule_Status",
+    "Efficiency_Status",
+    "Inefficiency_Cause",
+    "Trend_Status",
+    "Persistent_Inefficiency_Count",
+    "Persistent_Warning",
+    "Recommendation",
+    "Predicted_Risk",
+    "Baseline_Temp_Mean",
+    "Baseline_Humidity_Mean",
+    "Baseline_Power_Mean",
+    "Baseline_Cooling_Mean",
+    "Baseline_SEI_Mean",
+]
+
+
+def setup_dht():
+    return adafruit_dht.DHT22(DHT_GPIO, use_pulseio=False)
+
+
+def setup_ads():
+    i2c = busio.I2C(board.SCL, board.SDA)
+    ads = ADS.ADS1115(i2c, address=ADS_ADDR)
+    ads.gain = ADS_GAIN
+    ads.data_rate = ADS_DATARATE
+    return ads
+
+
+def measure_rms(
+    chan: AnalogIn,
+    window_sec: float = SAMPLE_WINDOW_SEC,
+    offset_samples: int = OFFSET_SAMPLES,
+    target_hz: int = TARGET_SAMPLE_HZ,
+) -> Optional[float]:
+    try:
+        offs = [chan.voltage for _ in range(offset_samples)]
+        v_offset = fmean(offs)
+
+        dt = 1.0 / max(1, target_hz)
+        t_end = time.perf_counter() + window_sec
+
+        sum_sq = 0.0
+        n = 0
+
+        while time.perf_counter() < t_end:
+            v = chan.voltage - v_offset
+            sum_sq += v * v
+            n += 1
+            time.sleep(dt)
+
+        if n == 0:
+            return None
+
+        return (sum_sq / n) ** 0.5
+    except Exception:
+        return None
+
+
+class DataLogger:
+    def __init__(self, xlsx_path: Path, csv_path: Path, sheet_name: str):
+        self.xlsx_path = xlsx_path
+        self.csv_path = csv_path
+        self.sheet_name = sheet_name
+        self.buffer: List[List] = []
+        self.last_save_ts = time.time()
+        self._open_or_create_excel()
+        self._init_csv()
+
+    def _open_or_create_excel(self):
+        if self.xlsx_path.exists():
+            self.wb = load_workbook(self.xlsx_path)
+            if self.sheet_name in self.wb.sheetnames:
+                self.ws = self.wb[self.sheet_name]
+            else:
+                self.ws = self.wb.create_sheet(self.sheet_name)
+
+            if self.ws.max_row == 1 and self.ws.cell(1, 1).value is None:
+                self.ws.append(HEADERS)
+        else:
+            self.wb = Workbook()
+            self.ws = self.wb.active
+            self.ws.title = self.sheet_name
+            self.ws.append(HEADERS)
+            self.wb.save(self.xlsx_path)
+
+    def _init_csv(self):
+        if not self.csv_path.exists():
+            with open(self.csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(HEADERS)
+
+    def append(self, row: List):
+        self.buffer.append(row)
+
+    def flush_if_needed(self, force: bool = False):
+        now = time.time()
+        need_save = (
+            force
+            or len(self.buffer) >= SAVE_EVERY_ROWS
+            or (now - self.last_save_ts) >= SAVE_EVERY_SEC
+        )
+
+        if not need_save or not self.buffer:
+            return
+
+        for r in self.buffer:
+            self.ws.append(r)
+
+        for _ in range(3):
+            try:
+                self.wb.save(self.xlsx_path)
+                break
+            except PermissionError:
+                time.sleep(0.5)
+
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(self.buffer)
+
+        self.buffer.clear()
+        self.last_save_ts = time.time()
+
+    def close(self):
+        self.flush_if_needed(force=True)
+
+
+def safe_mean(values):
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return None
+    return sum(valid) / len(valid)
+
+
+def safe_std(values):
+    valid = [v for v in values if v is not None]
+    if len(valid) < 2:
+        return None
+    mean_val = sum(valid) / len(valid)
+    variance = sum((x - mean_val) ** 2 for x in valid) / len(valid)
+    return variance ** 0.5
+
+
+def save_baseline_to_json(path: Path, baseline_data: dict):
+    with open(path, "w") as f:
+        json.dump(baseline_data, f, indent=4)
+
+
+def calculate_live_cooling_rate(temp_history, time_history):
+    valid_pairs = [
+        (t, ts) for t, ts in zip(temp_history, time_history)
+        if t is not None and ts is not None
+    ]
+
+    if len(valid_pairs) < 2:
+        return None
+
+    start_temp, start_time = valid_pairs[0]
+    end_temp, end_time = valid_pairs[-1]
+
+    dt_sec = (end_time - start_time).total_seconds()
+    if dt_sec <= 0:
+        return None
+
+    dt_min = dt_sec / 60.0
+    rate = (start_temp - end_temp) / dt_min
+
+    if abs(rate) > MAX_REASONABLE_COOLING_RATE:
+        return None
+
+    return rate
+
+
+def effective_cooling_rate(cooling_rate):
+    if cooling_rate is None:
+        return None
+    return max(0, cooling_rate)
+
+
+def calculate_sei(effective_cooling, apparent_power):
+    if effective_cooling is None or apparent_power is None or apparent_power <= 0:
+        return None
+
+    if apparent_power < LOW_LOAD_POWER_THRESHOLD:
+        return 0.0
+
+    if effective_cooling < 0.02:
+        return 0.0
+
+    return (effective_cooling / apparent_power) * SEI_SCALE_FACTOR
+
+
+def classify_live_efficiency(power, cooling, sei, sei_avg):
+    if power is None:
+        return "Unknown"
+
+    if sei is None:
+        return "Unknown"
+
+    if power < LOW_LOAD_POWER_THRESHOLD:
+        return "Idle/Very Low Load"
+
+    if cooling == 0 and power > HIGH_POWER_THRESHOLD:
+        return "Inefficient"
+
+    if sei_avg is not None and sei_avg > 0:
+        if sei >= sei_avg * 1.05:
+            return "Efficient"
+        elif sei >= sei_avg * 0.85:
+            return "Moderate"
+        else:
+            return "Inefficient"
+
+    if sei > 0:
+        return "Moderate"
+
+    return "Unknown"
+
+
+def diagnose_live_cause(power, power_avg, cooling, cooling_avg, sei, sei_avg):
+    if power is None:
+        return "Power data unavailable"
+
+    if sei is None:
+        return "Cooling or SEI not yet valid"
+
+    if power < LOW_LOAD_POWER_THRESHOLD:
+        return "Low-load or idle condition"
+
+    if sei_avg is not None and sei_avg > 0 and sei >= sei_avg * 0.85:
+        return "No major inefficiency detected"
+
+    cooling_drop = (
+        cooling_avg is not None
+        and cooling_avg > 0
+        and cooling is not None
+        and cooling < cooling_avg * 0.85
+    )
+    power_rise = (
+        power_avg is not None
+        and power_avg > 0
+        and power > power_avg * 1.10
+    )
+
+    if cooling_drop and power_rise:
+        return "Cooling rate dropped and apparent power increased"
+    elif cooling_drop:
+        return "Cooling rate dropped"
+    elif power_rise:
+        return "Apparent power increased"
+    else:
+        return "Minor fluctuation or transitional behavior"
+
+
+def get_live_trend(sei_history):
+    valid = [v for v in sei_history if v is not None]
+    if len(valid) < 3:
+        return "Insufficient history"
+
+    a, b, c = valid[-3], valid[-2], valid[-1]
+
+    if c > b > a:
+        return "Improving"
+    elif c < b < a:
+        return "Worsening"
+    else:
+        return "Stable/Fluctuating"
+
+
+def get_live_predicted_risk(status, trend):
+    if status in ["Anomalous / Inefficient", "Inefficient"] and trend == "Worsening":
+        return "High"
+    elif status in ["Anomalous / Inefficient", "Inefficient", "Anomalous Behavior"]:
+        return "Medium"
+    elif status == "Moderate":
+        return "Low"
+    else:
+        return "Minimal"
+
+
+def get_live_recommendation(status, cause, trend, persistent_warning):
+    if status == "Efficient":
+        return "System is operating efficiently."
+    if status == "Moderate":
+        return "Performance is acceptable but should be monitored."
+    if status == "Idle/Very Low Load":
+        return "System appears to be under very low load or idle condition."
+    if status == "Unknown":
+        return "Cooling trend is still stabilizing or some measurements are incomplete."
+    if status == "Anomalous Behavior":
+        return "ML detected deviation from learned site baseline, but efficiency metrics are not yet strongly degraded."
+    if status == "Anomalous / Inefficient":
+        return "Both ML and efficiency logic indicate degraded HVAC performance. Inspect airflow, cooling output, and load condition."
+
+    if persistent_warning == "Yes":
+        return "Persistent inefficiency detected across multiple cycles. System performance should be inspected."
+
+    if cause == "Cooling rate dropped and apparent power increased":
+        if trend == "Worsening":
+            return "Combined degradation detected. Efficiency may fall further if this continues."
+        return "Cooling is weaker while power draw is increasing."
+
+    if cause == "Cooling rate dropped":
+        return "Cooling effectiveness is reduced."
+
+    if cause == "Apparent power increased":
+        return "Power consumption increased without matching cooling improvement."
+
+    if cause == "Low-load or idle condition":
+        return "Low efficiency here may not indicate a fault."
+
+    return "Monitor the system for further changes."
+
+
+def build_ml_feature_row(t_c, rh, apparent_power, cooling_rate, eff_cooling, sei):
+    return {
+        "Temperature_C": float(t_c) if t_c is not None else np.nan,
+        "Humidity_%": float(rh) if rh is not None else np.nan,
+        "ApparentPower_VA": float(apparent_power) if apparent_power is not None else np.nan,
+        "Cooling_Rate_C_per_min": float(cooling_rate) if cooling_rate is not None else np.nan,
+        "Effective_Cooling_Rate_C_per_min": float(eff_cooling) if eff_cooling is not None else np.nan,
+        "Smart_Efficiency_Index": float(sei) if sei is not None else np.nan,
+    }
+
+
+def train_ml_model(feature_rows):
+    df = pd.DataFrame(feature_rows)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(df) < ML_MIN_VALID_ROWS:
+        return None, None, len(df)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df)
+
+    model = IsolationForest(
+        n_estimators=100,
+        contamination=ML_CONTAMINATION,
+        random_state=ML_RANDOM_STATE,
+    )
+    model.fit(X_scaled)
+
+    return scaler, model, len(df)
+
+
+def predict_ml_status(feature_row, scaler, model):
+    if scaler is None or model is None:
+        return None, None, "NOT_READY"
+
+    df = pd.DataFrame([feature_row]).replace([np.inf, -np.inf], np.nan).dropna()
+    if df.empty:
+        return None, None, "INSUFFICIENT_FEATURES"
+
+    X_scaled = scaler.transform(df)
+    pred = int(model.predict(X_scaled)[0])  # 1 normal, -1 anomaly
+    score = float(model.decision_function(X_scaled)[0])
+    label = "ANOMALY" if pred == -1 else "NORMAL"
+    return pred, score, label
+
+
+def fuse_final_status(rule_status, ml_label, sei, sei_avg):
+    if ml_label in ["NOT_READY", "INSUFFICIENT_FEATURES", None]:
+        return rule_status
+
+    if ml_label == "ANOMALY":
+        if rule_status == "Inefficient":
+            return "Anomalous / Inefficient"
+
+        if rule_status == "Moderate":
+            return "Anomalous Behavior"
+
+        if (
+            rule_status == "Efficient"
+            and sei is not None
+            and sei_avg is not None
+            and sei < sei_avg * 0.85
+        ):
+            return "Anomalous Behavior"
+
+        return rule_status
+
+    return rule_status
+
+
+def generate_final_graphs(csv_path: Path, graph_dir: Path):
+    if not csv_path.exists():
+        print("No CSV found. Skipping graph generation.")
+        return
+
+    try:
+        df = pd.read_csv(csv_path)
+        if df.empty or "Timestamp" not in df.columns:
+            print("CSV missing usable data. Skipping graph generation.")
+            return
+
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.dropna(subset=["Timestamp"]).copy()
+        if df.empty:
+            print("No valid timestamps found. Skipping graph generation.")
+            return
+
+        numeric_cols = [
+            "Temperature_C",
+            "Humidity_%",
+            "ApparentPower_VA",
+            "Cooling_Rate_C_per_min",
+            "Effective_Cooling_Rate_C_per_min",
+            "Smart_Efficiency_Index",
+            "SEI_MA_5",
+            "Power_MA_5",
+            "CoolingRate_MA_5",
+            "ML_Score",
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "Temperature_C" in df.columns:
+            plt.figure(figsize=(10, 4))
+            plt.plot(df["Timestamp"], df["Temperature_C"])
+            plt.title("Room Temperature Trend")
+            plt.xlabel("Time")
+            plt.ylabel("Temperature (°C)")
+            plt.xticks(rotation=20)
+            plt.tight_layout()
+            plt.savefig(graph_dir / "temperature_trend.png", dpi=200)
+            plt.close()
+
+        if "ApparentPower_VA" in df.columns:
+            plt.figure(figsize=(10, 4))
+            plt.plot(df["Timestamp"], df["ApparentPower_VA"])
+            plt.title("HVAC Apparent Power Trend")
+            plt.xlabel("Time")
+            plt.ylabel("Power (VA)")
+            plt.xticks(rotation=20)
+            plt.tight_layout()
+            plt.savefig(graph_dir / "power_trend.png", dpi=200)
+            plt.close()
+
+        if "Cooling_Rate_C_per_min" in df.columns:
+            temp_df = df.copy()
+            temp_df.loc[temp_df["Cooling_Rate_C_per_min"].abs() > 5, "Cooling_Rate_C_per_min"] = pd.NA
+            plt.figure(figsize=(10, 4))
+            plt.plot(temp_df["Timestamp"], temp_df["Cooling_Rate_C_per_min"])
+            plt.title("Cooling Rate Trend")
+            plt.xlabel("Time")
+            plt.ylabel("Cooling Rate (°C/min)")
+            plt.xticks(rotation=20)
+            plt.tight_layout()
+            plt.savefig(graph_dir / "cooling_rate_trend.png", dpi=200)
+            plt.close()
+
+        sei_cols = [c for c in ["Smart_Efficiency_Index", "SEI_MA_5"] if c in df.columns]
+        if sei_cols:
+            plt.figure(figsize=(10, 4))
+            for col in sei_cols:
+                plt.plot(df["Timestamp"], df[col], label=col)
+            plt.title("Smart Efficiency Index Trend")
+            plt.xlabel("Time")
+            plt.ylabel("SEI")
+            plt.legend()
+            plt.xticks(rotation=20)
+            plt.tight_layout()
+            plt.savefig(graph_dir / "sei_trend.png", dpi=200)
+            plt.close()
+
+        if "ML_Score" in df.columns:
+            plt.figure(figsize=(10, 4))
+            plt.plot(df["Timestamp"], df["ML_Score"])
+            plt.title("ML Anomaly Score Trend")
+            plt.xlabel("Time")
+            plt.ylabel("Isolation Forest Score")
+            plt.xticks(rotation=20)
+            plt.tight_layout()
+            plt.savefig(graph_dir / "ml_score_trend.png", dpi=200)
+            plt.close()
+
+        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+
+        if "Temperature_C" in df.columns:
+            axes[0].plot(df["Timestamp"], df["Temperature_C"])
+            axes[0].set_ylabel("Temp (°C)")
+            axes[0].set_title("Combined HVAC Monitoring Summary")
+
+        if "ApparentPower_VA" in df.columns:
+            axes[1].plot(df["Timestamp"], df["ApparentPower_VA"])
+            axes[1].set_ylabel("Power (VA)")
+
+        if "SEI_MA_5" in df.columns:
+            axes[2].plot(df["Timestamp"], df["SEI_MA_5"], label="SEI_MA_5")
+        elif "Smart_Efficiency_Index" in df.columns:
+            axes[2].plot(df["Timestamp"], df["Smart_Efficiency_Index"], label="SEI")
+        axes[2].set_ylabel("SEI")
+        axes[2].set_xlabel("Time")
+
+        for ax in axes:
+            ax.tick_params(axis="x", rotation=20)
+
+        plt.tight_layout()
+        plt.savefig(graph_dir / "combined_hvac_summary.png", dpi=200)
+        plt.close()
+
+        print(f"Graphs saved in: {graph_dir}")
+
+    except Exception as e:
+        print(f"Graph generation failed: {e}")
+
+
+def save_session_summary(csv_path: Path, output_path: Path):
+    if not csv_path.exists():
+        return
+
+    try:
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            return
+
+        summary = {}
+        for col in [
+            "Temperature_C",
+            "Humidity_%",
+            "ApparentPower_VA",
+            "Cooling_Rate_C_per_min",
+            "Effective_Cooling_Rate_C_per_min",
+            "Smart_Efficiency_Index",
+            "SEI_MA_5",
+            "ML_Score",
+        ]:
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce").dropna()
+                if not s.empty:
+                    summary[col] = {
+                        "mean": round(float(s.mean()), 3),
+                        "min": round(float(s.min()), 3),
+                        "max": round(float(s.max()), 3),
+                        "last": round(float(s.iloc[-1]), 3),
+                    }
+
+        if "Efficiency_Status" in df.columns:
+            summary["status_counts"] = df["Efficiency_Status"].value_counts(dropna=True).to_dict()
+
+        if "Rule_Status" in df.columns:
+            summary["rule_status_counts"] = df["Rule_Status"].value_counts(dropna=True).to_dict()
+
+        if "Predicted_Risk" in df.columns:
+            summary["risk_counts"] = df["Predicted_Risk"].value_counts(dropna=True).to_dict()
+
+        if "ML_Label" in df.columns:
+            summary["ml_label_counts"] = df["ML_Label"].value_counts(dropna=True).to_dict()
+
+        summary["rows_logged"] = int(len(df))
+
+        if "Timestamp" in df.columns:
+            ts = pd.to_datetime(df["Timestamp"], errors="coerce").dropna()
+            if not ts.empty:
+                summary["session_start"] = str(ts.iloc[0])
+                summary["session_end"] = str(ts.iloc[-1])
+                summary["duration_minutes"] = round((ts.iloc[-1] - ts.iloc[0]).total_seconds() / 60.0, 2)
+
+        with open(output_path, "w") as f:
+            json.dump(summary, f, indent=4)
+
+        print(f"Session summary saved to: {output_path}")
+
+    except Exception as e:
+        print(f"Session summary generation failed: {e}")
+
+
+def main():
+    print(f"Logging to Excel: {EXCEL_PATH}")
+    print(f"Logging to CSV:   {CSV_PATH}")
+    print(f"Baseline JSON path: {BASELINE_JSON_PATH}")
+
+    logger = DataLogger(EXCEL_PATH, CSV_PATH, SHEET_NAME)
+
+    dht = setup_dht()
+    ads = setup_ads()
+
+    voltage_chan = AnalogIn(ads, VOLTAGE_CHANNEL)
+    current_chan = AnalogIn(ads, CURRENT_CHANNEL)
+
+    last_valid_mains_vrms = None
+
+    cooling_history = deque(maxlen=5)
+    power_history = deque(maxlen=5)
+    sei_history = deque(maxlen=5)
+    temp_history = deque(maxlen=5)
+    time_history = deque(maxlen=5)
+
+    persistent_inefficiency_count = 0
+
+    calibration_mode = True
+    calibration_count = 0
+    baseline_ready = False
+
+    baseline_temp = []
+    baseline_rh = []
+    baseline_power = []
+    baseline_cooling = []
+    baseline_sei = []
+
+    ml_feature_rows = []
+    ml_scaler = None
+    ml_model = None
+    ml_ready = False
+
+    baseline_stats = {}
+
+    try:
+        while True:
+            now = datetime.now()
+
+            # -------- DHT with retry --------
+            try:
+                t_c = dht.temperature
+                rh = dht.humidity
+            except RuntimeError:
+                t_c = None
+                rh = None
+
+            if t_c is None or rh is None:
+                time.sleep(0.2)
+                try:
+                    t_c = dht.temperature
+                    rh = dht.humidity
+                except RuntimeError:
+                    t_c = None
+                    rh = None
+
+            if t_c is None or rh is None:
+                print(f"\n[{now:%Y-%m-%d %H:%M:%S}] DHT read failed after retry — skipping this cycle")
+                time.sleep(LOG_INTERVAL_SEC)
+                continue
+
+            if not (MIN_REASONABLE_TEMPERATURE <= t_c <= MAX_REASONABLE_TEMPERATURE):
+                print(f"\n[{now:%Y-%m-%d %H:%M:%S}] Temperature out of range — skipping cycle")
+                time.sleep(LOG_INTERVAL_SEC)
+                continue
+
+            if not (MIN_REASONABLE_HUMIDITY <= rh <= MAX_REASONABLE_HUMIDITY):
+                print(f"\n[{now:%Y-%m-%d %H:%M:%S}] Humidity out of range — skipping cycle")
+                time.sleep(LOG_INTERVAL_SEC)
+                continue
+
+            temp_history.append(t_c)
+            time_history.append(now)
+
+            # -------- Voltage --------
+            try:
+                v_instant = voltage_chan.voltage
+            except Exception:
+                v_instant = None
+
+            vrms_adc = measure_rms(voltage_chan)
+            mains_vrms = (
+                vrms_adc * ZMPT_TO_MAINS_SCALE * CALIBRATION_K
+                if vrms_adc is not None else None
+            )
+
+            if mains_vrms is not None and (
+                mains_vrms < MIN_REASONABLE_VOLTAGE or mains_vrms > MAX_REASONABLE_VOLTAGE
+            ):
+                mains_vrms = None
+
+            if mains_vrms is None and last_valid_mains_vrms is not None:
+                mains_vrms = last_valid_mains_vrms
+
+            if mains_vrms is not None:
+                last_valid_mains_vrms = mains_vrms
+
+            # -------- Current --------
+            try:
+                i_instant = current_chan.voltage
+            except Exception:
+                i_instant = None
+
+            irms_adc = measure_rms(current_chan)
+            irms = (irms_adc / ACS_SENSITIVITY) if irms_adc is not None else None
+
+            if irms is not None and (
+                irms < MIN_REASONABLE_CURRENT or irms > MAX_REASONABLE_CURRENT
+            ):
+                irms = None
+
+            # -------- Power --------
+            apparent_power = (
+                mains_vrms * irms
+                if mains_vrms is not None and irms is not None else None
+            )
+
+            # -------- Cooling --------
+            cooling_rate = calculate_live_cooling_rate(temp_history, time_history)
+            eff_cooling = effective_cooling_rate(cooling_rate)
+            sei = calculate_sei(eff_cooling, apparent_power)
+
+            cooling_history.append(eff_cooling)
+            power_history.append(apparent_power)
+            sei_history.append(sei)
+
+            cooling_avg = safe_mean(cooling_history)
+            power_avg = safe_mean(power_history)
+            sei_avg = safe_mean(sei_history)
+
+            feature_row = build_ml_feature_row(
+                t_c=t_c,
+                rh=rh,
+                apparent_power=apparent_power,
+                cooling_rate=cooling_rate,
+                eff_cooling=eff_cooling,
+                sei=sei,
+            )
+
+            # -------- Calibration mode --------
+            if calibration_mode:
+                baseline_temp.append(t_c)
+                baseline_rh.append(rh)
+
+                if apparent_power is not None:
+                    baseline_power.append(apparent_power)
+                if eff_cooling is not None:
+                    baseline_cooling.append(eff_cooling)
+                if sei is not None:
+                    baseline_sei.append(sei)
+
+                ml_feature_rows.append(feature_row)
+                calibration_count += 1
+
+                print("\n==== CALIBRATION MODE ====")
+                print(f"Learning local baseline... {calibration_count}/{CALIBRATION_READINGS}")
+                print(f"Time: {now:%Y-%m-%d %H:%M:%S}")
+                print(f"Temperature: {t_c:.2f} C")
+                print(f"Humidity: {rh:.2f} %")
+                print(f"Apparent Power: {apparent_power:.2f} VA" if apparent_power is not None else "Apparent Power: --")
+                print(f"Cooling Rate: {cooling_rate:.3f}" if cooling_rate is not None else "Cooling Rate: --")
+                print(f"SEI: {sei:.3f}" if sei is not None else "SEI: --")
+
+                logger.append([
+                    now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "CALIBRATION",
+                    round(t_c, 2),
+                    round(rh, 2),
+                    round(v_instant, 4) if v_instant is not None else None,
+                    round(vrms_adc, 4) if vrms_adc is not None else None,
+                    round(mains_vrms, 2) if mains_vrms is not None else None,
+                    round(i_instant, 4) if i_instant is not None else None,
+                    round(irms, 3) if irms is not None else None,
+                    round(apparent_power, 2) if apparent_power is not None else None,
+                    round(cooling_rate, 3) if cooling_rate is not None else None,
+                    round(eff_cooling, 3) if eff_cooling is not None else None,
+                    round(sei, 3) if sei is not None else None,
+                    round(cooling_avg, 3) if cooling_avg is not None else None,
+                    round(power_avg, 3) if power_avg is not None else None,
+                    round(sei_avg, 3) if sei_avg is not None else None,
+                    None,
+                    None,
+                    "CALIBRATING",
+                    None,
+                    "Calibration",
+                    "Learning site baseline",
+                    "Calibration",
+                    0,
+                    "No",
+                    "System is learning current site baseline and ML baseline.",
+                    "Minimal",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ])
+                logger.flush_if_needed()
+
+                if calibration_count >= CALIBRATION_READINGS:
+                    valid_cooling = [x for x in baseline_cooling if x is not None and x > 0]
+                    valid_sei = [x for x in baseline_sei if x is not None and x > 0]
+
+                    if len(valid_cooling) < 2 or len(valid_sei) < 2:
+                        print("\nBaseline cooling/SEI not meaningful yet. Extending calibration...")
+                        calibration_count = CALIBRATION_READINGS - 3
+                        time.sleep(LOG_INTERVAL_SEC)
+                        continue
+
+                    baseline_stats = {
+                        "temperature_mean": safe_mean(baseline_temp),
+                        "temperature_std": safe_std(baseline_temp) or MIN_STD_EPSILON,
+                        "humidity_mean": safe_mean(baseline_rh),
+                        "humidity_std": safe_std(baseline_rh) or MIN_STD_EPSILON,
+                        "power_mean": safe_mean(baseline_power),
+                        "power_std": safe_std(baseline_power) or MIN_STD_EPSILON,
+                        "cooling_mean": safe_mean(baseline_cooling),
+                        "cooling_std": safe_std(baseline_cooling) or MIN_STD_EPSILON,
+                        "sei_mean": safe_mean(baseline_sei),
+                        "sei_std": safe_std(baseline_sei) or MIN_STD_EPSILON,
+                        "calibrated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+
+                    ml_scaler, ml_model, valid_ml_rows = train_ml_model(ml_feature_rows)
+                    ml_ready = ml_scaler is not None and ml_model is not None
+
+                    baseline_stats["ml_ready"] = ml_ready
+                    baseline_stats["ml_valid_rows"] = valid_ml_rows
+                    baseline_stats["ml_contamination"] = ML_CONTAMINATION
+                    baseline_stats["calibration_readings"] = CALIBRATION_READINGS
+
+                    save_baseline_to_json(BASELINE_JSON_PATH, baseline_stats)
+                    calibration_mode = False
+                    baseline_ready = True
+
+                    print("\n==== BASELINE LEARNED SUCCESSFULLY ====")
+                    print(f"Baseline saved to: {BASELINE_JSON_PATH}")
+                    print(json.dumps(baseline_stats, indent=4))
+
+                    if ml_ready:
+                        print("Isolation Forest ML model trained successfully on current-site baseline.")
+                    else:
+                        print("ML model could not be trained yet. Rule-based monitoring will continue.")
+
+                time.sleep(LOG_INTERVAL_SEC)
+                continue
+
+            # -------- ML prediction --------
+            ml_prediction, ml_score, ml_label = predict_ml_status(feature_row, ml_scaler, ml_model)
+
+            # -------- Live classification --------
+            rule_status = classify_live_efficiency(apparent_power, eff_cooling, sei, sei_avg)
+            cause = diagnose_live_cause(apparent_power, power_avg, eff_cooling, cooling_avg, sei, sei_avg)
+            trend = get_live_trend(sei_history)
+            status = fuse_final_status(rule_status, ml_label, sei, sei_avg)
+            risk = get_live_predicted_risk(status, trend)
+
+            if status in ["Inefficient", "Anomalous / Inefficient"]:
+                persistent_inefficiency_count += 1
+            else:
+                persistent_inefficiency_count = 0
+
+            persistent_warning = "Yes" if persistent_inefficiency_count >= PERSISTENT_LIMIT else "No"
+            recommendation = get_live_recommendation(status, cause, trend, persistent_warning)
+            mode = "ADAPTIVE_AI_MONITORING" if baseline_ready else "MONITORING"
+
+            print("\n==== LIVE HVAC AI STATUS ====")
+            print(f"Mode: {mode}")
+            print(f"Time: {now:%Y-%m-%d %H:%M:%S}")
+            print(f"Temperature: {t_c:.2f} C")
+            print(f"Humidity: {rh:.2f} %")
+            print(f"Mains Vrms: {mains_vrms:.2f} V" if mains_vrms is not None else "Mains Vrms: --")
+            print(f"Irms: {irms:.3f} A" if irms is not None else "Irms: --")
+            print(f"Apparent Power: {apparent_power:.2f} VA" if apparent_power is not None else "Apparent Power: --")
+            print(f"Cooling Rate: {cooling_rate:.3f} C/min" if cooling_rate is not None else "Cooling Rate: --")
+            print(f"Effective Cooling Rate: {eff_cooling:.3f} C/min" if eff_cooling is not None else "Effective Cooling Rate: --")
+            print(f"Smart Efficiency Index: {sei:.3f}" if sei is not None else "Smart Efficiency Index: --")
+            print(f"ML Prediction: {ml_prediction}" if ml_prediction is not None else "ML Prediction: --")
+            print(f"ML Score: {ml_score:.6f}" if ml_score is not None else "ML Score: --")
+            print(f"ML Label: {ml_label}")
+            print(f"Rule Status: {rule_status}")
+            print(f"Final Efficiency Status: {status}")
+            print(f"Cause: {cause}")
+            print(f"Trend: {trend}")
+            print(f"Persistent Warning: {persistent_warning}")
+            print(f"Recommendation: {recommendation}")
+            print(f"Predicted Risk: {risk}")
+
+            logger.append([
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                mode,
+                round(t_c, 2),
+                round(rh, 2),
+                round(v_instant, 4) if v_instant is not None else None,
+                round(vrms_adc, 4) if vrms_adc is not None else None,
+                round(mains_vrms, 2) if mains_vrms is not None else None,
+                round(i_instant, 4) if i_instant is not None else None,
+                round(irms, 3) if irms is not None else None,
+                round(apparent_power, 2) if apparent_power is not None else None,
+                round(cooling_rate, 3) if cooling_rate is not None else None,
+                round(eff_cooling, 3) if eff_cooling is not None else None,
+                round(sei, 3) if sei is not None else None,
+                round(cooling_avg, 3) if cooling_avg is not None else None,
+                round(power_avg, 3) if power_avg is not None else None,
+                round(sei_avg, 3) if sei_avg is not None else None,
+                ml_prediction,
+                round(ml_score, 6) if ml_score is not None else None,
+                ml_label,
+                rule_status,
+                status,
+                cause,
+                trend,
+                persistent_inefficiency_count,
+                persistent_warning,
+                recommendation,
+                risk,
+                round(baseline_stats.get("temperature_mean"), 3) if baseline_stats.get("temperature_mean") is not None else None,
+                round(baseline_stats.get("humidity_mean"), 3) if baseline_stats.get("humidity_mean") is not None else None,
+                round(baseline_stats.get("power_mean"), 3) if baseline_stats.get("power_mean") is not None else None,
+                round(baseline_stats.get("cooling_mean"), 3) if baseline_stats.get("cooling_mean") is not None else None,
+                round(baseline_stats.get("sei_mean"), 3) if baseline_stats.get("sei_mean") is not None else None,
+            ])
+
+            logger.flush_if_needed()
+            time.sleep(LOG_INTERVAL_SEC)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user. Saving data...")
+    finally:
+        logger.close()
+
+        try:
+            dht.exit()
+        except Exception:
+            pass
+
+        print("\nGenerating final graphs and session summary...")
+        generate_final_graphs(CSV_PATH, GRAPH_DIR)
+        save_session_summary(CSV_PATH, SESSION_SUMMARY_JSON_PATH)
+
+
+if __name__ == "__main__":
+    main()
