@@ -123,7 +123,17 @@ The system generates graphs to visualise changes in operating conditions and eff
 
 ### HVAC Monitoring Dashboard
 
-![HVAC Monitoring Dashboard](Approach_4_Adaptive_AI/Results/dashboard.png)
+#### Dashboard Screenshot 1
+
+![HVAC Dashboard 1](Approach_4_Adaptive_AI/Results/dashboard1.jpeg)
+
+#### Dashboard Screenshot 2
+
+![HVAC Dashboard 2](Approach_4_Adaptive_AI/Results/dashboard2.jpeg)
+
+#### Dashboard Screenshot 3
+
+![HVAC Dashboard 3](Approach_4_Adaptive_AI/Results/dashboard3.jpeg)
 
 ### Smart Efficiency Index Trend
 
@@ -146,6 +156,13 @@ AI-Driven-IoT-HVAC/
 │
 ├── Approach_4_Adaptive_AI/
 │   ├── Results/
+│   │   ├── dashboard1.jpeg
+│   │   ├── dashboard2.jpeg
+│   │   ├── dashboard3.jpeg
+│   │   ├── sei_trend.png
+│   │   ├── power_trend.png
+│   │   └── temperature_trend.png
+│   │
 │   ├── input_data/
 │   ├── output_data/
 │   ├── dashboard.py
